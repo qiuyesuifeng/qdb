@@ -17,6 +17,16 @@ var (
 	ErrClosed = errors.New("store has been closed")
 )
 
+const (
+	defaultChanNum = 1000
+)
+
+type item struct {
+	db  uint32
+	key []byte
+	tag string
+}
+
 type Store struct {
 	mu sync.RWMutex
 	db engine.Database
@@ -29,6 +39,9 @@ type Store struct {
 	postCommitHandlers []ForwardHandler
 
 	deleteIfExpired atomic2.Int64
+	expiredCount    atomic2.Int64
+
+	expiredChan chan *item
 }
 
 func New(db engine.Database) *Store {
@@ -36,6 +49,10 @@ func New(db engine.Database) *Store {
 
 	s.preCommitHandlers = make([]ForwardHandler, 0)
 	s.postCommitHandlers = make([]ForwardHandler, 0)
+
+	s.expiredChan = make(chan *item, defaultChanNum)
+
+	go s.checkExp()
 
 	return s
 }
@@ -223,6 +240,38 @@ func (s *Store) compact(start, limit []byte) error {
 		return err
 	} else {
 		return nil
+	}
+}
+
+func (s *Store) sendExpChan(m *item) {
+	s.expiredCount.Incr()
+	s.expiredChan <- m
+}
+
+func (s *Store) doExp(m *item) {
+	if m == nil {
+		return
+	}
+
+	s.expiredCount.Decr()
+
+	s.acquire()
+	defer s.release()
+
+	_, err := s.checkExpAndDelete(nil, m.db, m.key)
+	if err != nil {
+		log.Errorf("delete object fail - %s, %d, %s, %s", err, m.db, m.key, m.tag)
+	}
+
+	// fmt.Printf("delete object ok - %d, %s, %s\n", m.db, m.key, m.tag)
+}
+
+func (s *Store) checkExp() {
+	for {
+		select {
+		case m := <-s.expiredChan:
+			s.doExp(m)
+		}
 	}
 }
 

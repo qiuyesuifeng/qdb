@@ -5,7 +5,6 @@ package store
 
 import (
 	"encoding/binary"
-	"fmt"
 	"math"
 	"strings"
 
@@ -121,8 +120,11 @@ func (s *Store) loadStringRow(db uint32, key []byte) (*stringRow, error) {
 	if o == nil {
 		return nil, nil
 	}
+
 	if expired {
-		return nil, errors.Trace(s.delete(db, key, o))
+		m := &item{db, key, "loadStringRow"}
+		s.sendExpChan(m)
+		return nil, nil
 	}
 
 	x, ok := o.(*stringRow)
@@ -130,20 +132,6 @@ func (s *Store) loadStringRow(db uint32, key []byte) (*stringRow, error) {
 		return x, nil
 	}
 	return nil, errors.Trace(ErrNotString)
-}
-
-func (s *Store) get(db uint32, key []byte) ([]byte, error) {
-	o, err := s.loadStringRow(db, key)
-	if err != nil || o == nil {
-		return nil, err
-	}
-
-	_, err = o.LoadDataValue(s)
-	if err != nil {
-		return nil, err
-	}
-
-	return o.Value, nil
 }
 
 // GET key
@@ -157,27 +145,18 @@ func (s *Store) Get(db uint32, args [][]byte) ([]byte, error) {
 	if err := s.acquireRead(); err != nil {
 		return nil, err
 	}
+	defer s.releaseRead()
 
 	o, expired, err := s.loadStoreRow(db, key)
 	if err != nil || o == nil {
-		s.releaseRead()
 		return nil, err
 	}
 
-	// if the key has been expired, we should delete it
-	// release read lock and try to get write lock
 	if expired {
-		s.releaseRead()
-
-		if err := s.acquire(); err != nil {
-			return nil, err
-		}
-		defer s.release()
-
-		return s.get(db, key)
+		m := &item{db, key, "get"}
+		s.sendExpChan(m)
+		return nil, nil
 	}
-
-	defer s.releaseRead()
 
 	x, ok := o.(*stringRow)
 	if !ok {
@@ -709,7 +688,7 @@ func (s *Store) MSet(db uint32, args [][]byte) error {
 	for i := len(args)/2 - 1; i >= 0; i-- {
 		key, value := args[i*2], args[i*2+1]
 		if !ms.Has(key) {
-			_, err := s.deleteIfExists(bt, db, key)
+			_, err := s.checkExistAndDelete(bt, db, key)
 			if err != nil {
 				return err
 			}
@@ -748,7 +727,7 @@ func (s *Store) MSetNX(db uint32, args [][]byte) (int64, error) {
 		}
 
 		if expired {
-			err = s.delete(db, key, o)
+			_, err = s.checkExistAndDelete(nil, db, key)
 			if err != nil {
 				return 0, err
 			}
@@ -1055,7 +1034,7 @@ func (s *Store) BitOp(db uint32, args [][]byte) (int64, error) {
 			case BitXOR:
 				value[j] ^= ro.Value[j]
 			default:
-				return 0, fmt.Errorf("invalid op type: %s", op)
+				return 0, errors.Errorf("invalid op type: %s", op)
 			}
 		}
 
@@ -1073,7 +1052,7 @@ func (s *Store) BitOp(db uint32, args [][]byte) (int64, error) {
 
 	bt := engine.NewBatch()
 
-	_, err = s.deleteIfExists(bt, db, destKey)
+	_, err = s.checkExistAndDelete(bt, db, destKey)
 	if err != nil {
 		return 0, err
 	}

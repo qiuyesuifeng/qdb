@@ -95,7 +95,7 @@ func (s *Store) loadListRow(db uint32, key []byte) (*listRow, error) {
 		return nil, nil
 	}
 	if expired {
-		return nil, errors.Trace(s.delete(db, key, o))
+		return nil, errors.Trace(s.delete(nil, db, key, o))
 	}
 
 	x, ok := o.(*listRow)

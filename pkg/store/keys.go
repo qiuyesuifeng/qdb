@@ -25,8 +25,13 @@ func (s *Store) loadStoreRow(db uint32, key []byte) (storeRow, bool, error) {
 	return o, o.IsExpired(), nil
 }
 
-func (s *Store) delete(db uint32, key []byte, o storeRow) error {
-	bt := engine.NewBatch()
+func (s *Store) delete(bt *engine.Batch, db uint32, key []byte, o storeRow) error {
+	if bt != nil {
+		return o.deleteObject(s, bt)
+	}
+
+	// create a new batch
+	bt = engine.NewBatch()
 	if err := o.deleteObject(s, bt); err != nil {
 		return err
 	}
@@ -35,14 +40,26 @@ func (s *Store) delete(db uint32, key []byte, o storeRow) error {
 	return s.commit(bt, fw)
 }
 
-func (s *Store) deleteIfExists(bt *engine.Batch, db uint32, key []byte) (bool, error) {
+func (s *Store) checkExpAndDelete(bt *engine.Batch, db uint32, key []byte) (bool, error) {
 	o, err := loadStoreRow(s, db, key)
 	if err != nil || o == nil {
 		return false, err
 	}
-	// if key is already expired, we think it is not exists
-	exists := !o.IsExpired()
-	return exists, o.deleteObject(s, bt)
+
+	if o.IsExpired() {
+		return true, s.delete(bt, db, key, o)
+	}
+
+	return false, nil
+}
+
+func (s *Store) checkExistAndDelete(bt *engine.Batch, db uint32, key []byte) (bool, error) {
+	o, err := loadStoreRow(s, db, key)
+	if err != nil || o == nil {
+		return false, err
+	}
+
+	return !o.IsExpired(), s.delete(bt, db, key, o)
 }
 
 // DEL key [key ...]
@@ -62,7 +79,7 @@ func (s *Store) Del(db uint32, args [][]byte) (int64, error) {
 	bt := engine.NewBatch()
 	for _, key := range keys {
 		if !ms.Has(key) {
-			exists, err := s.deleteIfExists(bt, db, key)
+			exists, err := s.checkExistAndDelete(bt, db, key)
 			if err != nil {
 				return 0, err
 			}
@@ -83,17 +100,19 @@ func (s *Store) Dump(db uint32, args [][]byte) (interface{}, error) {
 
 	key := args[0]
 
-	if err := s.acquire(); err != nil {
+	if err := s.acquireRead(); err != nil {
 		return nil, err
 	}
-	defer s.release()
+	defer s.releaseRead()
 
 	o, expired, err := s.loadStoreRow(db, key)
 	if err != nil || o == nil {
 		return nil, err
 	}
 	if expired {
-		return nil, errors.Trace(s.delete(db, key, o))
+		m := &item{db, key, "dump"}
+		s.sendExpChan(m)
+		return nil, nil
 	}
 
 	x, err := o.loadObjectValue(s)
@@ -112,17 +131,19 @@ func (s *Store) Type(db uint32, args [][]byte) (ObjectCode, error) {
 
 	key := args[0]
 
-	if err := s.acquire(); err != nil {
+	if err := s.acquireRead(); err != nil {
 		return 0, err
 	}
-	defer s.release()
+	defer s.releaseRead()
 
 	o, expired, err := s.loadStoreRow(db, key)
 	if err != nil || o == nil {
 		return 0, err
 	}
 	if expired {
-		return 0, errors.Trace(s.delete(db, key, o))
+		m := &item{db, key, "type"}
+		s.sendExpChan(m)
+		return 0, nil
 	}
 
 	return o.Code(), nil
@@ -136,17 +157,19 @@ func (s *Store) Exists(db uint32, args [][]byte) (int64, error) {
 
 	key := args[0]
 
-	if err := s.acquire(); err != nil {
+	if err := s.acquireRead(); err != nil {
 		return 0, err
 	}
-	defer s.release()
+	defer s.releaseRead()
 
 	o, expired, err := s.loadStoreRow(db, key)
 	if err != nil || o == nil {
 		return 0, err
 	}
 	if expired {
-		return 0, errors.Trace(s.delete(db, key, o))
+		m := &item{db, key, "exists"}
+		s.sendExpChan(m)
+		return 0, nil
 	}
 
 	return 1, nil
@@ -197,7 +220,7 @@ func (s *Store) getExpireTTLms(db uint32, key []byte) (int64, error) {
 		return -2, nil
 	}
 	if expired {
-		return -2, errors.Trace(s.delete(db, key, o))
+		return -2, errors.Trace(s.delete(nil, db, key, o))
 	}
 
 	ttlms, _ := ExpireAtToTTLms(o.GetExpireAt())
@@ -210,7 +233,7 @@ func (s *Store) setExpireAt(db uint32, key []byte, expireat int64) (int64, error
 		return 0, err
 	}
 	if expired {
-		return 0, errors.Trace(s.delete(db, key, o))
+		return 0, errors.Trace(s.delete(nil, db, key, o))
 	}
 
 	bt := engine.NewBatch()
@@ -220,7 +243,7 @@ func (s *Store) setExpireAt(db uint32, key []byte, expireat int64) (int64, error
 		fw := &Forward{DB: db, Op: "PExpireAt", Args: [][]byte{key, FormatInt(expireat)}}
 		return 1, s.commit(bt, fw)
 	} else {
-		_, err := s.deleteIfExists(bt, db, key)
+		err := s.delete(bt, db, key, o)
 		if err != nil {
 			return 0, err
 		}
@@ -247,7 +270,7 @@ func (s *Store) Persist(db uint32, args [][]byte) (int64, error) {
 		return 0, err
 	}
 	if expired {
-		return 0, errors.Trace(s.delete(db, key, o))
+		return 0, errors.Trace(s.delete(nil, db, key, o))
 	}
 
 	if o.GetExpireAt() == 0 {
@@ -414,7 +437,7 @@ func (s *Store) Restore(db uint32, args [][]byte) error {
 }
 
 func (s *Store) restore(bt *engine.Batch, db uint32, key []byte, expireat int64, obj interface{}) error {
-	_, err := s.deleteIfExists(bt, db, key)
+	_, err := s.checkExistAndDelete(bt, db, key)
 	if err != nil {
 		return err
 	}

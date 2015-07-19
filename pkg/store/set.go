@@ -134,7 +134,7 @@ func (s *Store) loadSetRow(db uint32, key []byte) (*setRow, error) {
 		return nil, nil
 	}
 	if expired {
-		return nil, errors.Trace(s.delete(db, key, o))
+		return nil, errors.Trace(s.delete(nil, db, key, o))
 	}
 
 	x, ok := o.(*setRow)

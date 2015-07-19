@@ -205,7 +205,7 @@ func (s *Store) loadZSetRow(db uint32, key []byte) (*zsetRow, error) {
 		return nil, nil
 	}
 	if expired {
-		return nil, s.delete(db, key, o)
+		return nil, s.delete(nil, db, key, o)
 	}
 
 	x, ok := o.(*zsetRow)
